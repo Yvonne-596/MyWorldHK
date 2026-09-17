@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HK Central · 香港中环 · 我的世界</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#87b7e8;font-family:sans-serif}
+  #app{position:fixed;inset:0}
+  canvas{display:block}
+  #crosshair{position:fixed;left:50%;top:50%;width:18px;height:18px;transform:translate(-50%,-50%);pointer-events:none;z-index:5}
+  #crosshair::before,#crosshair::after{content:"";position:absolute;background:rgba(255,255,255,.85);box-shadow:0 0 2px rgba(0,0,0,.6)}
+  #crosshair::before{left:50%;top:0;width:2px;height:100%;transform:translateX(-50%)}
+  #crosshair::after{top:50%;left:0;width:100%;height:2px;transform:translateY(-50%)}
+  #hud{position:fixed;left:10px;bottom:10px;z-index:5;color:#fff;font-size:13px;text-shadow:1px 1px 2px #000;background:rgba(0,0,0,.45);padding:8px 12px;border-radius:6px;pointer-events:none;line-height:1.6}
+  #hotbar{position:fixed;left:50%;bottom:10px;transform:translateX(-50%);z-index:6;display:flex;gap:4px;background:rgba(0,0,0,.5);padding:5px;border-radius:6px;pointer-events:none}
+  .slot{width:44px;height:44px;border:2px solid #333;border-radius:4px;position:relative;background:rgba(255,255,255,.08)}
+  .slot.active{border-color:#fff;background:rgba(255,255,255,.25)}
+  .slot .swatch{position:absolute;inset:5px;border-radius:2px}
+  .slot .key{position:absolute;top:1px;left:4px;font-size:10px;color:#fff;text-shadow:1px 1px 1px #000}
+  #overlay{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(10,20,40,.7);color:#fff;text-align:center;cursor:pointer}
+  #overlay h1{margin:0 0 8px;font-size:26px;letter-spacing:2px}
+  #overlay p{margin:3px 0;font-size:14px;opacity:.9}
+  #overlay .go{margin-top:18px;padding:10px 26px;font-size:16px;background:#2f9e44;border:none;border-radius:6px;color:#fff;cursor:pointer}
+  #loading{position:fixed;inset:0;z-index:11;display:flex;align-items:center;justify-content:center;background:#0a1a30;color:#fff;font-size:18px}
+</style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="crosshair"></div>
+  <div id="hotbar"></div>
+  <div id="hud"></div>
+  <div id="overlay">
+    <h1>香港 · 中环 · 我的世界</h1>
+    <p>HK CENTRAL — 体素城市沙盒</p>
+    <p>点击进入 · 鼠标环视 · WASD 移动 · 空格跳跃 · F 飞行</p>
+    <p>左键 拆除方块 · 右键 放置方块 · 1~9/滚轮 切换方块</p>
+    <button class="go">开始探索</button>
+  </div>
+  <div id="loading">正在生成香港中环…</div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.152.2/three.min.js"></script>
+  <script>window.THREE||document.write('<scr'+'ipt src="https://unpkg.com/three@0.152.2/build/three.min.js"><\/scr'+'ipt>');</script>
+
+  <script>
+const THREE=window.THREE;
+if(!THREE){document.getElementById('loading').textContent='Three.js 加载失败：请检查网络后刷新页面';throw new Error('THREE missing');}
+
+// ================= 世界尺寸 =================
+const XS = 160, YS = 100, ZS = 160;           // 世界范围
+const GROUND = 0;                             // 地面层
+// 方块 id
+const B = {
+  air:0, road:1, walk:2, glass:3, water:4, park:5,
+  sand:6, steel:7, trim:8, brick:9, dirt:10, concrete:11, white:12, gold:13
+};
+// 方块 -> 材质 tile 索引
+const TILE_BY_BLOCK = {
+  [B.air]:0,[B.road]:1,[B.walk]:2,[B.glass]:3,[B.water]:4,[B.park]:5,
+  [B.sand]:6,[B.steel]:7,[B.trim]:8,[B.brick]:9,[B.dirt]:10,[B.concrete]:11,[B.white]:12,[B.gold]:13
+};
+// 透明（不参与遮挡剔除的面）方块
+const NON_OPAQUE = new Set([B.glass, B.water]);
+
+const blocks = new Uint8Array(XS * YS * ZS);
+const idx = (x,y,z) => x + z*XS + y*XS*ZS;
+function set(x,y,z,id){ if(x>=0&&x<XS&&y>=0&&y<YS&&z>=0&&z<ZS) blocks[idx(x,y,z)]=id; }
+function get(x,y,z){ if(x<0||x>=XS||y<0||y>=YS||z<0||z>=ZS) return B.air; return blocks[idx(x,y,z)]; }
+function isSolid(x,y,z){ const i=get(x,y,z); return i!==B.air && i!==B.water; }
+
+// ================= 程序化纹理图集 =================
+const TILE=16, COLS=8, TILES=14, ROWS=Math.ceil(TILES/COLS);
+function tileUV(t){ const col=t%COLS,row=(t/COLS)|0;
+  return {u:col/COLS, v:1-(row+1)/ROWS, w:1/COLS, h:1/ROWS}; }
+function makeAtlas(){
+  const c=document.createElement('canvas'); c.width=COLS*TILE; c.height=ROWS*TILE;
+  const g=c.getContext('2d');
+  const rnd=()=>Math.random();
+  const px=(x,y,r,gr,b,a=255)=>{g.fillStyle='rgba('+r+','+gr+','+b+','+a+')';g.fillRect(x,y,1,1);};
+  const speck=(t,base,vary)=>{const ox=(t%COLS)*TILE,oy=((t/COLS)|0)*TILE;
+    for(let y=0;y<TILE;y++)for(let x=0;x<TILE;x++){const d=(rnd()*vary*2-vary)|0;
+      px(ox+x,oy+y,base[0]+d,base[1]+d,base[2]+d);}};
+  speck(0,[120,120,140],6);      // 0 空气占位
+  speck(1,[62,64,68],10);        // 1 马路
+  speck(2,[168,166,162],8);      // 2 人行道
+  {const ox=3*TILE,oy=0*TILE;for(let y=0;y<TILE;y++)for(let x=0;x<TILE;x++){
+    const edge=(x===0||y===0||x===TILE-1||y===TILE-1);
+    px(ox+x,oy+y, edge?190:210, edge?210:235, 255, edge?255:200);}}  // 3 玻璃
+  {const ox=4*TILE,oy=0*TILE;for(let y=0;y<TILE;y++)for(let x=0;x<TILE;x++){
+    const d=(rnd()*10-5)|0;px(ox+x,oy+y,30+d,80+d,200+d,190);}}      // 4 水
+  speck(5,[96,170,62],12);       // 5 公园草地
+  speck(6,[216,202,152],9);      // 6 沙
+  speck(7,[120,128,142],10);     // 7 钢
+  speck(8,[238,238,240],5);      // 8 白色饰条
+  {const ox=9*TILE,oy=0*TILE;for(let y=0;y<TILE;y++)for(let x=0;x<TILE;x++){
+    const row=(y/8)|0, off=row%2===0?0:4, isB=((x+off)/4|0)%2===0;
+    const mortar=(y%8===0)||((x+off)%4===0); let base=mortar?195:(isB?150:118);
+    const d=(rnd()*14-7)|0; px(ox+x,oy+y,base+d,92+d,70+d);}}          // 9 红砖
+  speck(10,[128,95,62],12);      // 10 泥土
+  speck(11,[150,152,156],8);     // 11 混凝土
+  speck(12,[244,244,246],5);     // 12 白线
+  speck(13,[226,180,70],10);     // 13 金色饰条
+  const tex=new THREE.CanvasTexture(c); tex.magFilter=THREE.NearestFilter;
+  tex.minFilter=THREE.NearestFilter; tex.generateMipmaps=false; tex.colorSpace=THREE.SRGBColorSpace;
+  return tex;
+}
+
+// ================= 体素网格构建（合并几何体 + 面剔除 + 面着色） =================
+const FACES=[
+  {n:[ 1,0,0],c:[[1,0,1],[1,0,0],[1,1,0],[1,1,1]]},
+  {n:[-1,0,0],c:[[0,0,0],[0,0,1],[0,1,1],[0,1,0]]},
+  {n:[ 0,1,0],c:[[0,1,1],[0,1,0],[1,1,0],[1,1,1]]},
+  {n:[ 0,-1,0],c:[[0,0,0],[0,0,1],[1,0,1],[1,0,0]]},
+  {n:[ 0,0,1],c:[[0,0,1],[1,0,1],[1,1,1],[0,1,1]]},
+  {n:[ 0,0,-1],c:[[1,0,0],[0,0,0],[0,1,0],[1,1,0]]},
+];
+const CUV=[[0,0],[1,0],[1,1],[0,1]];
+const SHADE=[0.7,0.7,1.0,0.55,0.8,0.8]; // +x,-x,+y(顶),-y(底),+z,-z
+
+function addFace(x,y,z,f,tile,pos,nor,uv,col,ind,v0,shade){
+  const fc=FACES[f], tu=tileUV(tile), n=fc.n;
+  const u0=tu.u, vTop=tu.v+tu.h, uw=tu.w, uh=tu.h;
+  for(let c=0;c<4;c++){
+    const cc=fc.c[c];
+    pos.push(x+cc[0],y+cc[1],z+cc[2]); nor.push(n[0],n[1],n[2]);
+    uv.push(u0+CUV[c][0]*uw, vTop-CUV[c][1]*uh);
+    col.push(shade,shade,shade);
+  }
+  ind.push(v0,v0+1,v0+2, v0,v0+2,v0+3);
+}
+function buildMesh(){
+  const pos=[],nor=[],uv=[],col=[],ind=[]; let vc=0;
+  for(let y=0;y<YS;y++)for(let z=0;z<ZS;z++)for(let x=0;x<XS;x++){
+    const id=get(x,y,z); if(id===B.air) continue;
+    const tile=TILE_BY_BLOCK[id]!==undefined?TILE_BY_BLOCK[id]:0;
+    const nb=[get(x+1,y,z),get(x-1,y,z),get(x,y+1,z),get(x,y-1,z),get(x,y,z+1),get(x,y,z-1)];
+    for(let f=0;f<6;f++){
+      const nid=nb[f];
+      if(nid!==B.air && !NON_OPAQUE.has(nid)) continue; // 被遮挡则不画
+      addFace(x,y,z,f,tile,pos,nor,uv,col,ind,vc,SHADE[f]); vc+=4;
+    }
+  }
+  if(pos.length===0) return null;
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+  geo.setAttribute('normal',new THREE.Float32BufferAttribute(nor,3));
+  geo.setAttribute('uv',new THREE.Float32BufferAttribute(uv,2));
+  geo.setAttribute('color',new THREE.Float32BufferAttribute(col,3));
+  geo.setIndex(ind); return geo;
+}
+
+// ================= 香港中环城市生成 =================
+function fillRect(x0,x1,y0,y1,z0,z1,id){ for(let y=y0;y<=y1;y++)for(let z=z0;z<=z1;z++)for(let x=x0;x<=x1;x++) set(x,y,z,id); }
+function inTri(px,pz,ax,az,bx,bz,cx,cz){
+  const d1=(px-bx)*(az-bz)-(ax-bx)*(pz-bz);
+  const d2=(px-cx)*(bz-cz)-(bx-cx)*(pz-cz);
+  const d3=(px-ax)*(cz-az)-(cx-ax)*(pz-az);
+  const n=d1<0||d2<0||d3<0, p=d1>0||d2>0||d3>0;
+  return !(n&&p);
+}
+function inTriEdge(px,pz,ax,az,bx,bz,cx,cz,tol){
+  return Math.abs((px-bx)*(az-bz)-(ax-bx)*(pz-bz))<tol ||
+         Math.abs((px-cx)*(bz-cz)-(bx-cx)*(pz-cz))<tol ||
+         Math.abs((px-ax)*(cz-az)-(cx-ax)*(pz-az))<tol;
+}
+
+function buildCity(){
+  // ---- 地面基础：人行道 ----
+  for(let z=0;z<ZS;z++)for(let x=0;x<XS;x++){ set(x,GROUND,z, B.walk); }
+  // 道路（混凝土 + 白线）
+  const road=(x0,x1,z0,z1)=>{
+    fillRect(x0,x1,GROUND,GROUND,z0,z1, B.road);
+    const mx=(x0+x1)>>1; if(mx>0&&mx<XS) for(let z=z0+2;z<=z1-2;z+=8) set(mx,GROUND,z,B.white);
+  };
+  // 道路网络（1格=4米）
+  road(0,XS-1,34,37);    // 德辅道中（东西向，汇丰北侧）
+  road(0,XS-1,72,75);    // 皇后大道（东西向，两楼之间）
+  road(20,23,0,ZS-1);    // 毕打街（南北向，汇丰西侧）
+  road(60,63,0,ZS-1);    // 遮打道（南北向，两楼之间）
+  road(92,95,0,ZS-1);    // 花园道（南北向，中银东侧）
+
+  // ---- 维港（南侧水面） ----
+  fillRect(0,XS-1,GROUND+1,3,150,ZS-1, B.water);
+  fillRect(0,XS-1,GROUND,GROUND,149,149, B.concrete);   // 海堤
+
+  // ---- 皇后像广场（绿地，两楼之间） ----
+  fillRect(50,60,GROUND,GROUND,62,70, B.park);
+
+  // ---- 两栋地标（高保真复刻） ----
+  buildHSBC(34,50);   // 汇丰总行（高技派，底层架空+外柱+桁架+直升机坪+炮筒）
+  buildBOC(74,90);    // 中银大厦（4三角柱体从西向东阶梯上升，东侧最高带双桅杆）
+
+  // ---- 背景天际线（边缘，不干扰核心区） ----
+  buildTower(12,130,16,16,95, B.glass, B.steel);   // 国际金融中心（IFC）
+  buildTower(100,40,12,12,32, B.glass, B.steel);
+  buildTower(110,115,12,14,38, B.glass, B.steel);
+  buildTower(125,80,11,13,22, B.brick, B.white);
+}
+
+// 中银大厦（贝聿铭）：4个等腰直角三角形柱体，直角在中心、斜边对应北东南西
+// 高度从西向东阶梯上升：西79m/北158m/南236m/东315m，东侧最高顶带双桅杆达368m
+function buildBOC(cx,cz){
+  const w=6, by=GROUND+1;            // 半宽6格(52m/4-1)
+  const hW=20, hN=40, hS=59, hE=79;  // 格：79/158/236/315 米
+  // 浅灰花岗岩基座
+  fillRect(cx-w,cx+w,by,by+1,cz-w,cz+w, B.concrete);
+  // 四个三角柱体：中心最高、向各自斜边线性收低（斜切尖顶）
+  for(let x=cx-w;x<=cx+w;x++)for(let z=cz-w;z<=cz+w;z++){
+    const dx=x-cx, dz=z-cz, adx=Math.abs(dx), adz=Math.abs(dz);
+    let H, d;
+    if(adx>=adz){ if(dx>=0){ H=hE; d=(cx+w-x)/w; } else { H=hW; d=(x-(cx-w))/w; } }
+    else { if(dz>=0){ H=hS; d=(cz+w-z)/w; } else { H=hN; d=(z-(cz-w))/w; } }
+    const top=Math.round(H*d);       // 中心最高H，斜边最低
+    const isEdge=(x===cx-w||x===cx+w||z===cz-w||z===cz+w);
+    for(let y=by+2;y<by+2+top;y++){
+      set(x,y,z, isEdge?B.white:B.glass);   // 外墙铝条白，内玻璃银蓝
+    }
+    // 横向铝条（每4格一道，模拟菱形网格，避免X形）
+    for(let y=by+2;y<by+2+top;y+=4){ if(get(x,y,z)===B.glass) set(x,y,z,B.white); }
+  }
+  // 东柱顶部双桅杆：主桅杆52m(13格)，副桅杆略低
+  const py=by+2+hE;
+  for(let y=py;y<=py+13;y++){ set(cx,y,cz,B.steel); }          // 主桅杆
+  for(let y=py;y<=py+11;y++){ set(cx,y,cz-1,B.steel); }        // 副桅杆
+}
+
+// 汇丰总行（福斯特·高技派）：底部架空、外骨骼钢柱+三角桁架、平顶直升机坪、炮筒清洁装置
+function buildHSBC(cx,cz){
+  const wX=9, wZ=7, by=GROUND+1, h=45;   // 18x14格=70x55m，高45格=180m
+  const x0=cx-wX, x1=cx+wX-1, z0=cz-wZ, z1=cz+wZ-1;
+  const under=2;                          // 底层架空8m(约10m)
+  // 架空层地板
+  fillRect(x0,x1,by-1,by-1,z0,z1, B.concrete);
+  // 8组外露铝包钢柱（4角+4边中点，亮银）
+  const cols=[[x0,z0],[x1,z0],[x0,z1],[x1,z1],[cx,z0],[cx,z1],[x0,cz],[x1,cz]];
+  for(const c of cols){ for(let y=by;y<by+h+1;y++) set(c[0],y,c[1],B.white); }
+  // 主体（架空之上）
+  for(let y=by+under;y<by+h;y++){
+    for(let z=z0;z<=z1;z++)for(let x=x0;x<=x1;x++){
+      const onEdge=(x===x0||x===x1||z===z0||z===z1);
+      set(x,y,z, onEdge?B.steel:B.glass);
+    }
+    if((y-by)%4===0){
+      for(let z=z0;z<=z1;z++)for(let x=x0;x<=x1;x++) if(get(x,y,z)===B.glass) set(x,y,z,B.white);
+    }
+  }
+  // 5道三角形悬挂桁架（外伸横撑，高技派）
+  for(let i=0;i<5;i++){
+    const yh=by+under+4+i*8;
+    for(let x=x0-1;x<=x1+1;x++){ if(x<x0||x>x1){ set(x,yh,z0,B.steel); set(x,yh,z1,B.steel); } }
+    for(let z=z0-1;z<=z1+1;z++){ if(z<z0||z>z1){ set(x0,yh,z,B.steel); set(x1,yh,z,B.steel); } }
+  }
+  // 平顶直升机坪
+  const roofY=by+h-1;
+  fillRect(x0,x1,roofY,roofY,z0,z1, B.road);
+  set(cx-1,roofY,cz,B.white); set(cx,roofY,cz,B.white); set(cx+1,roofY,cz,B.white);   // H标志
+  set(cx,roofY,z0+1,B.white); set(cx,roofY,z1-1,B.white);
+  // 楼顶炮筒形清洁玻璃装置（横向钢圆筒，保留）
+  const bcy=roofY+1, bcz=cz, cy=bcy+2, r=2;
+  for(let x=x0+2;x<=x1-2;x++){
+    for(let yy=cy-r;yy<=cy+r;yy++)for(let zz=bcz-r;zz<=bcz+r;zz++){
+      const dd=(yy-cy)*(yy-cy)+(zz-bcz)*(zz-bcz);
+      if(dd<=r*r+0.6) set(x,yy,zz,B.steel);
+    }
+  }
+  set(x0+2,roofY+1,bcz,B.steel); set(x0+2,roofY+2,bcz,B.steel);
+  set(x1-2,roofY+1,bcz,B.steel); set(x1-2,roofY+2,bcz,B.steel);
+  fillRect(x1-4,x1-2,roofY+1,roofY+2,bcz-3,bcz+3, B.white);   // 控制室
+}
+
+// 普通玻璃塔
+function buildTower(cx,cz,w,d,h,face,edge){
+  const baseY=GROUND+1, x0=cx-(w>>1), x1=x0+w-1, z0=cz-(d>>1), z1=z0+d-1;
+  for(let y=baseY;y<baseY+h;y++)for(let z=z0;z<=z1;z++)for(let x=x0;x<=x1;x++){
+    const onEdge=x===x0||x===x1||z===z0||z===z1;
+    set(x,y,z, onEdge?edge:face);
+    if((y-baseY)%5===0 && !onEdge) set(x,y,z,B.white);
+  }
+  fillRect(cx-1,cx+1,baseY+h,baseY+h+2,cz-1,cz+1,B.steel);
+}
+
+buildCity();
+
+// ---- 皇后像广场：树木与雕像 ----
+function treeAt(x,z){
+  for(let y=GROUND+1;y<=GROUND+3;y++) set(x,y,z, B.dirt);
+  for(let dx=-1;dx<=1;dx++)for(let dz=-1;dz<=1;dz++)for(let y=GROUND+4;y<=GROUND+5;y++) set(x+dx,y,z+dz, B.park);
+  set(x,GROUND+6,z, B.park);
+}
+function tramAt(x0,z0){
+  for(let x=x0;x<=x0+12;x++){ set(x,GROUND+1,z0, B.park); set(x,GROUND+1,z0+1, B.park); set(x,GROUND+3,z0, B.trim); set(x,GROUND+3,z0+1, B.trim); }
+  for(let x=x0+1;x<=x0+11;x++){ set(x,GROUND+2,z0, B.glass); set(x,GROUND+2,z0+1, B.glass); }
+  set(x0,GROUND+2,z0, B.trim); set(x0,GROUND+2,z0+1, B.trim);
+  set(x0+12,GROUND+2,z0, B.trim); set(x0+12,GROUND+2,z0+1, B.trim);
+}
+treeAt(51,63); treeAt(59,63); treeAt(51,69); treeAt(59,69);
+fillRect(54,56,GROUND+1,GROUND+1,65,67, B.concrete);
+set(55,GROUND+2,66, B.trim); set(55,GROUND+3,66, B.trim); set(55,GROUND+4,66, B.trim);
+// ---- 德辅道中的叮叮车（双层电车，汇丰北侧车道） ----
+tramAt(28,35); tramAt(74,35);
+
+// ================= 场景 / 渲染 =================
+const app=document.getElementById('app');
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x87b7e8);
+scene.fog=new THREE.Fog(0x87b7e8,220,420);
+
+const atlas=makeAtlas();
+const mat=new THREE.MeshLambertMaterial({map:atlas,vertexColors:true,alphaTest:0.5,side:THREE.DoubleSide});
+const geo=buildMesh();
+let worldMesh=new THREE.Mesh(geo,mat); worldMesh.matrixAutoUpdate=false;
+scene.add(worldMesh);
+
+const ambient=new THREE.AmbientLight(0xffffff,0.6); scene.add(ambient);
+const sun=new THREE.DirectionalLight(0xfff2cc,1.1); sun.position.set(120,180,80); scene.add(sun);
+const fillLight=new THREE.DirectionalLight(0x9fb6ff,0.35); fillLight.position.set(-120,60,-80); scene.add(fillLight);
+
+const camera=new THREE.PerspectiveCamera(75,innerWidth/innerHeight,0.1,700);
+
+// ================= 玩家控制器 =================
+const player={ pos:new THREE.Vector3(55,2,66), vel:new THREE.Vector3(),
+  yaw:Math.PI*0.6, pitch:-0.1, onGround:false, flying:false };
+const HEIGHT=1.8, RADIUS=0.3, EYE=1.62;
+const KEYS={};
+addEventListener('keydown',e=>{KEYS[e.code]=true;});
+addEventListener('keyup',e=>{KEYS[e.code]=false;});
+function moveAxis(a,sign){
+  const p=player.pos;
+  const x0=Math.floor(p.x-RADIUS),x1=Math.floor(p.x+RADIUS);
+  const y0=Math.floor(p.y),y1=Math.floor(p.y+HEIGHT);
+  const z0=Math.floor(p.z-RADIUS),z1=Math.floor(p.z+RADIUS);
+  let hit=false;
+  for(let y=y0;y<=y1;y++)for(let z=z0;z<=z1;z++)for(let x=x0;x<=x1;x++){
+    if(isSolid(x,y,z)){ hit=true;
+      if(a===1){ if(sign>=0)p.y=y-HEIGHT-0.001; else p.y=y+1.001; }
+      else if(a===0){ p.x=sign>=0?x-RADIUS-0.001:x+RADIUS+0.001; }
+      else { p.z=sign>=0?z-RADIUS-0.001:z+RADIUS+0.001; }
+    }
+  }
+  return hit;
+}
+function updatePlayer(dt){
+  const f=KEYS['KeyW']?1:KEYS['KeyS']?-1:0;
+  const s=KEYS['KeyD']?1:KEYS['KeyA']?-1:0;
+  const sin=Math.sin(player.yaw),cos=Math.cos(player.yaw);
+  const fx=-sin,fz=-cos,rx=cos,rz=-sin;
+  let mx=fx*f+rx*s, mz=fz*f+rz*s;
+  const len=Math.hypot(mx,mz); if(len>0){mx/=len;mz/=len;}
+  const sp=KEYS['ControlLeft']?6.0:4.2;
+  if(player.flying){
+    const v=f||s?sp:0;
+    player.vel.set(mx*v,0,mz*v);
+    if(KEYS['Space'])player.vel.y+=14*dt;
+    if(KEYS['ShiftLeft'])player.vel.y-=14*dt;
+    player.pos.x+=player.vel.x*dt; moveAxis(0,Math.sign(player.vel.x));
+    player.pos.z+=player.vel.z*dt; moveAxis(2,Math.sign(player.vel.z));
+    player.pos.y+=player.vel.y*dt; moveAxis(1,Math.sign(player.vel.y));
+    return;
+  }
+  player.vel.y-=25*dt; if(player.vel.y<-60)player.vel.y=-60;
+  if(KEYS['Space']&&player.onGround){player.vel.y=8.5;}
+  player.pos.y+=player.vel.y*dt;
+  if(moveAxis(1,Math.sign(player.vel.y))){ if(player.vel.y<0)player.onGround=true; player.vel.y=0; }
+  else player.onGround=false;
+  player.pos.x+=mx*sp*dt; moveAxis(0,Math.sign(mx*sp));
+  player.pos.z+=mz*sp*dt; moveAxis(2,Math.sign(mz*sp));
+}
+function updateCamera(){
+  camera.position.set(player.pos.x, player.pos.y+EYE, player.pos.z);
+  camera.rotation.order='YXZ'; camera.rotation.y=player.yaw; camera.rotation.x=player.pitch;
+}
+
+// ================= 方块交互 =================
+const raycaster=new THREE.Raycaster();
+const highlight=new THREE.Mesh(new THREE.BoxGeometry(1.002,1.002,1.002),
+  new THREE.MeshBasicMaterial({wireframe:true,color:0x000000,transparent:true,opacity:0.5}));
+highlight.visible=false; scene.add(highlight);
+let target=null;
+function trace(){
+  raycaster.setFromCamera({x:0,y:0},camera);
+  const o=camera.position.clone(), dir=raycaster.ray.direction.clone();
+  let t=0, prev=null; const maxD=7, step=0.05;
+  while(t<maxD){
+    const px=o.x+dir.x*t, py=o.y+dir.y*t, pz=o.z+dir.z*t;
+    const bx=Math.floor(px),by=Math.floor(py),bz=Math.floor(pz);
+    const id=get(bx,by,bz);
+    if(id!==B.air && id!==B.water){
+      let n={x:0,y:0,z:0};
+      if(prev){const dx=bx-prev.x,dy=by-prev.y,dz=bz-prev.z;
+        if(dx!==0)n={x:Math.sign(dx),y:0,z:0};else if(dy!==0)n={x:0,y:Math.sign(dy),z:0};else n={x:0,y:0,z:Math.sign(dz)};}
+      return {x:bx,y:by,z:bz,n};
+    }
+    prev={x:bx,y:by,z:bz}; t+=step;
+  }
+  return null;
+}
+function rebuild(){
+  const old=worldMesh; scene.remove(old); old.geometry.dispose();
+  const g=buildMesh(); if(!g) return;
+  worldMesh=new THREE.Mesh(g,mat); worldMesh.matrixAutoUpdate=false;
+  scene.add(worldMesh);
+}
+function breakBlock(){ if(!target)return; set(target.x,target.y,target.z,B.air); rebuild(); }
+function placeBlock(){
+  if(!target)return;
+  const n=target.n, px=target.x+n.x, py=target.y+n.y, pz=target.z+n.z;
+  const x0=Math.floor(player.pos.x-RADIUS),x1=Math.floor(player.pos.x+RADIUS);
+  const y0=Math.floor(player.pos.y),y1=Math.floor(player.pos.y+HEIGHT);
+  const z0=Math.floor(player.pos.z-RADIUS),z1=Math.floor(player.pos.z+RADIUS);
+  if(px>=x0&&px<=x1&&py>=y0&&py<=y1&&pz>=z0&&pz<=z1) return;
+  if(get(px,py,pz)!==B.air) return;
+  set(px,py,pz,selectedId); rebuild();
+}
+
+// ================= 快捷栏 =================
+const HOTBAR=[
+  {name:'混凝土',tile:B.concrete,color:'#96989c'},
+  {name:'玻璃',tile:B.glass,color:'#d2eaff'},
+  {name:'马路',tile:B.road,color:'#3e4044'},
+  {name:'草地',tile:B.park,color:'#60aa3e'},
+  {name:'沙子',tile:B.sand,color:'#d8ca98'},
+  {name:'红砖',tile:B.brick,color:'#96605a'},
+  {name:'钢板',tile:B.steel,color:'#78808e'},
+  {name:'白饰',tile:B.white,color:'#eeeef0'},
+  {name:'金饰',tile:B.gold,color:'#e2b446'},
+];
+let selectedId=HOTBAR[0].tile;
+const hotbarEl=document.getElementById('hotbar');
+function buildHotbar(){
+  hotbarEl.innerHTML='';
+  HOTBAR.forEach((hb,i)=>{
+    const d=document.createElement('div'); d.className='slot'+(i===0?' active':'');
+    d.innerHTML='<span class="key">'+(i+1)+'</span><div class="swatch" style="background:'+hb.color+'"></div>';
+    hotbarEl.appendChild(d);
+  });
+}
+buildHotbar();
+function selectSlot(i){ if(i<0||i>=HOTBAR.length)return; selectedId=HOTBAR[i].tile;
+  [...hotbarEl.children].forEach((el,j)=>el.classList.toggle('active',j===i)); }
+addEventListener('keydown',e=>{ if(/^Digit[1-9]$/.test(e.code)) selectSlot(parseInt(e.code[5])-1); });
+addEventListener('wheel',e=>{ const i=HOTBAR.findIndex(h=>h.tile===selectedId);
+  selectSlot((i+(e.deltaY>0?1:-1)+HOTBAR.length)%HOTBAR.length); });
+
+// ================= 指针锁定 / 输入 =================
+let locked=false;
+const overlay=document.getElementById('overlay'), loading=document.getElementById('loading');
+overlay.addEventListener('click',()=>{ app.requestPointerLock(); });
+document.addEventListener('pointerlockchange',()=>{ locked=document.pointerLockElement===app;
+  overlay.style.display=locked?'none':'flex'; });
+document.addEventListener('mousemove',e=>{ if(!locked)return;
+  player.yaw-=e.movementX*0.0022; player.pitch-=e.movementY*0.0022;
+  player.pitch=Math.max(-1.5,Math.min(1.5,player.pitch)); });
+addEventListener('mousedown',e=>{ if(!locked)return;
+  if(e.button===0) breakBlock(); else if(e.button===2) placeBlock(); });
+addEventListener('contextmenu',e=>e.preventDefault());
+addEventListener('keydown',e=>{ if(e.code==='KeyF') player.flying=!player.flying; });
+
+const hud=document.getElementById('hud');
+hud.innerHTML='香港 · 中环 Central<br>汇丰总行大厦 + 中银大厦三面塔<br>WASD 移动 · 空格跳 · F 飞行 · 左键拆 · 右键放';
+
+// ================= 主循环 =================
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth,innerHeight); renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+app.appendChild(renderer.domElement);
+addEventListener('resize',()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight); });
+
+let last=performance.now();
+loading.style.display='none';
+function loop(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now;
+  updatePlayer(dt); updateCamera();
+  const hit=trace();
+  if(hit){ highlight.visible=true; highlight.position.set(hit.x+0.5,hit.y+0.5,hit.z+0.5); target=hit; }
+  else{ highlight.visible=false; target=null; }
+  renderer.render(scene,camera);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
